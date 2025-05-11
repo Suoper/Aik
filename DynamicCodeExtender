@@ -1,0 +1,427 @@
+using System;
+using System.CodeDom.Compiler;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using System.Text;
+using System.Threading.Tasks;
+using Microsoft.CSharp;
+using UnityEngine;
+
+namespace AiSorcery
+{
+    public class DynamicCodeExecutor : MonoBehaviour
+    {
+        // References to necessary game components
+        private ChatGPTMod.ChatGPTSpellController aiController;
+        private List<Assembly> dynamicAssemblies = new List<Assembly>();
+
+        // Track created behavior instances
+        private List<MonoBehaviour> dynamicBehaviors = new List<MonoBehaviour>();
+
+        // Configuration
+        [SerializeField] private bool enableUnsafeCodeExecution = false;
+        [SerializeField] private bool logCompiledCode = true;
+        [SerializeField] private string scriptOutputDirectory = "DynamicScripts";
+
+        // Required Unity assemblies for compilation
+        private string[] requiredAssemblies = new string[] {
+            "System.dll",
+            "System.Core.dll",
+            "UnityEngine.dll",
+            "UnityEngine.CoreModule.dll",
+            "UnityEngine.PhysicsModule.dll",
+            "UnityEngine.AnimationModule.dll",
+            "UnityEngine.InputModule.dll",
+            "UnityEngine.UI.dll"
+        };
+
+        private void Awake()
+        {
+            // Get reference to ChatGPT controller
+            aiController = FindObjectOfType<ChatGPTMod.ChatGPTSpellController>();
+
+            if (aiController == null)
+            {
+                Debug.LogError("DynamicCodeExecutor: ChatGPTSpellController not found!");
+            }
+
+            // Create script output directory if it doesn't exist
+            string fullPath = Path.Combine(Application.persistentDataPath, scriptOutputDirectory);
+            if (!Directory.Exists(fullPath))
+            {
+                Directory.CreateDirectory(fullPath);
+            }
+
+            Debug.Log($"DynamicCodeExecutor initialized. Script output directory: {fullPath}");
+        }
+
+        /// <summary>
+        /// Generates, compiles and runs dynamic code based on a prompt
+        /// </summary>
+        public async Task<string> GenerateAndExecuteCode(string prompt)
+        {
+            try
+            {
+                // 1. Get AI to generate code based on the prompt
+                string generatedCode = await GetCodeFromAI(prompt);
+
+                // 2. Clean up and prepare the code for compilation
+                string processedCode = ProcessGeneratedCode(generatedCode);
+
+                // 3. Optionally log the code we're about to compile
+                if (logCompiledCode)
+                {
+                    Debug.Log("Compiling dynamic code:\n" + processedCode);
+                    SaveGeneratedCode(processedCode, prompt);
+                }
+
+                // 4. Compile the code into an assembly
+                Assembly assembly = CompileCode(processedCode);
+                if (assembly == null)
+                {
+                    return "Failed to compile the generated code. Check the logs for details.";
+                }
+
+                // 5. Execute the code
+                string result = ExecuteCompiledCode(assembly);
+
+                return $"Successfully executed dynamic code!\n\n{result}";
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError($"Error in GenerateAndExecuteCode: {ex.Message}\n{ex.StackTrace}");
+                return $"Error executing dynamic code: {ex.Message}";
+            }
+        }
+
+        /// <summary>
+        /// Creates and attaches a new MonoBehaviour from generated code
+        /// </summary>
+        public async Task<string> CreateAndAttachBehavior(string prompt, GameObject targetObject = null)
+        {
+            try
+            {
+                // 1. Get AI to generate a MonoBehaviour class
+                string request = $"Generate a complete Unity MonoBehaviour class that {prompt}. " +
+                                "Include all necessary using statements. " +
+                                "The class must inherit from MonoBehaviour. " +
+                                "Implement appropriate Unity lifecycle methods like Start, Update, etc. as needed. " +
+                                "Use best practices for Unity development.";
+
+                string generatedCode = await GetCodeFromAI(request);
+
+                // 2. Process the code to ensure it's a valid MonoBehaviour
+                string processedCode = ProcessMonoBehaviourCode(generatedCode);
+
+                // 3. Log and save the code
+                if (logCompiledCode)
+                {
+                    Debug.Log("Compiling dynamic MonoBehaviour:\n" + processedCode);
+                    SaveGeneratedCode(processedCode, "MonoBehaviour_" + prompt);
+                }
+
+                // 4. Compile the code
+                Assembly assembly = CompileCode(processedCode);
+                if (assembly == null)
+                {
+                    return "Failed to compile the generated MonoBehaviour. Check the logs for details.";
+                }
+
+                // 5. Find the MonoBehaviour class in the assembly
+                Type[] types = assembly.GetTypes();
+                Type monoBehaviourType = null;
+
+                foreach (Type type in types)
+                {
+                    if (typeof(MonoBehaviour).IsAssignableFrom(type))
+                    {
+                        monoBehaviourType = type;
+                        break;
+                    }
+                }
+
+                if (monoBehaviourType == null)
+                {
+                    return "No MonoBehaviour class found in the generated code.";
+                }
+
+                // 6. Attach the MonoBehaviour to the target GameObject
+                if (targetObject == null)
+                {
+                    // Create a new GameObject if none provided
+                    targetObject = new GameObject($"Dynamic_{monoBehaviourType.Name}");
+                }
+
+                // Add the component using reflection
+                MonoBehaviour newBehavior = (MonoBehaviour)targetObject.AddComponent(monoBehaviourType);
+                dynamicBehaviors.Add(newBehavior);
+
+                return $"Successfully created and attached {monoBehaviourType.Name} to {targetObject.name}!";
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError($"Error in CreateAndAttachBehavior: {ex.Message}\n{ex.StackTrace}");
+                return $"Error creating behavior: {ex.Message}";
+            }
+        }
+
+        /// <summary>
+        /// Gets code from the AI using the ChatGPTSpellController
+        /// </summary>
+        private async Task<string> GetCodeFromAI(string prompt)
+        {
+            if (aiController == null)
+            {
+                throw new Exception("ChatGPTSpellController not found!");
+            }
+
+            // Add specific instructions to get well-formatted code
+            string enhancedPrompt = $"Generate valid C# code for Unity that addresses the following request. " +
+                                   $"Return ONLY the code without explanations or markdown formatting: {prompt}";
+
+            // Call the SendCommandToOpenAI method which is the actual method in your ChatGPTSpellController
+            string response = await aiController.SendCommandToOpenAI(enhancedPrompt);
+
+            // Extract code from potential markdown blocks or explanations
+            return ExtractCodeFromResponse(response);
+        }
+
+        /// <summary>
+        /// Extracts clean code from AI response
+        /// </summary>
+        private string ExtractCodeFromResponse(string response)
+        {
+            // Try to extract code between markdown code blocks if they exist
+            if (response.Contains("```csharp"))
+            {
+                int startIndex = response.IndexOf("```csharp");
+                int endIndex = response.IndexOf("```", startIndex + 8);
+
+                if (startIndex >= 0 && endIndex > startIndex)
+                {
+                    return response.Substring(startIndex + 8, endIndex - startIndex - 8).Trim();
+                }
+            }
+            else if (response.Contains("```cs"))
+            {
+                int startIndex = response.IndexOf("```cs");
+                int endIndex = response.IndexOf("```", startIndex + 5);
+
+                if (startIndex >= 0 && endIndex > startIndex)
+                {
+                    return response.Substring(startIndex + 5, endIndex - startIndex - 5).Trim();
+                }
+            }
+            else if (response.Contains("```"))
+            {
+                int startIndex = response.IndexOf("```");
+                int endIndex = response.IndexOf("```", startIndex + 3);
+
+                if (startIndex >= 0 && endIndex > startIndex)
+                {
+                    return response.Substring(startIndex + 3, endIndex - startIndex - 3).Trim();
+                }
+            }
+
+            // If no code blocks found, return the entire response
+            return response;
+        }
+
+        /// <summary>
+        /// Processes the generated code to ensure it's compilable
+        /// </summary>
+        private string ProcessGeneratedCode(string code)
+        {
+            // Check if the code contains a class or namespace declaration
+            if (!code.Contains("class ") && !code.Contains("namespace "))
+            {
+                // Wrap the code in a class if it doesn't have one
+                code = $@"
+using UnityEngine;
+using System;
+using System.Collections;
+using System.Collections.Generic;
+
+namespace AiSorcery.DynamicCode
+{{
+    public class DynamicScript
+    {{
+        public static string Execute()
+        {{
+            try
+            {{
+                {code}
+                return ""Code executed successfully."";
+            }}
+            catch (Exception ex)
+            {{
+                return $""Error executing code: {{ex.Message}}"";
+            }}
+        }}
+    }}
+}}";
+            }
+
+            return code;
+        }
+
+        /// <summary>
+        /// Processes MonoBehaviour code to ensure it's properly formatted
+        /// </summary>
+        private string ProcessMonoBehaviourCode(string code)
+        {
+            // Make sure necessary using statements are present
+            if (!code.Contains("using UnityEngine;"))
+            {
+                code = "using UnityEngine;\n" + code;
+            }
+
+            // Ensure it has a namespace
+            if (!code.Contains("namespace "))
+            {
+                code = $@"
+using System;
+using System.Collections;
+using System.Collections.Generic;
+
+namespace AiSorcery.DynamicBehaviors
+{{
+{code}
+}}";
+            }
+
+            return code;
+        }
+
+        /// <summary>
+        /// Compiles C# code into an assembly
+        /// </summary>
+        private Assembly CompileCode(string code)
+        {
+            CSharpCodeProvider provider = new CSharpCodeProvider();
+            CompilerParameters parameters = new CompilerParameters();
+
+            // Add references to necessary assemblies
+            foreach (string assembly in requiredAssemblies)
+            {
+                parameters.ReferencedAssemblies.Add(assembly);
+            }
+
+            // Add reference to currently executing assembly
+            parameters.ReferencedAssemblies.Add(Assembly.GetExecutingAssembly().Location);
+
+            // Set compilation options
+            parameters.GenerateInMemory = true;
+            parameters.GenerateExecutable = false;
+
+            // Try to find and add references to common Unity assemblies
+            string unityEditorPath = Path.GetDirectoryName(typeof(UnityEngine.Debug).Assembly.Location);
+            if (Directory.Exists(unityEditorPath))
+            {
+                foreach (string file in Directory.GetFiles(unityEditorPath, "*.dll"))
+                {
+                    if (!parameters.ReferencedAssemblies.Contains(file))
+                    {
+                        try
+                        {
+                            // Try to load the assembly to verify it's valid
+                            Assembly.LoadFrom(file);
+                            parameters.ReferencedAssemblies.Add(file);
+                        }
+                        catch (Exception)
+                        {
+                            // Skip invalid assemblies
+                        }
+                    }
+                }
+            }
+
+            // Compile the code
+            CompilerResults results = provider.CompileAssemblyFromSource(parameters, code);
+
+            // Check for compilation errors
+            if (results.Errors.HasErrors)
+            {
+                StringBuilder errorBuilder = new StringBuilder("Compilation errors:\n");
+                foreach (CompilerError error in results.Errors)
+                {
+                    errorBuilder.AppendLine($"Line {error.Line}: {error.ErrorText}");
+                }
+                Debug.LogError(errorBuilder.ToString());
+                return null;
+            }
+
+            // Store the assembly for future reference
+            dynamicAssemblies.Add(results.CompiledAssembly);
+            return results.CompiledAssembly;
+        }
+
+        /// <summary>
+        /// Executes code from a compiled assembly
+        /// </summary>
+        private string ExecuteCompiledCode(Assembly assembly)
+        {
+            // Look for an Execute method in any class
+            foreach (Type type in assembly.GetTypes())
+            {
+                MethodInfo executeMethod = type.GetMethod("Execute", BindingFlags.Public | BindingFlags.Static);
+                if (executeMethod != null)
+                {
+                    return executeMethod.Invoke(null, null) as string;
+                }
+            }
+
+            // If no Execute method found, just return the list of types as confirmation
+            StringBuilder typeList = new StringBuilder("Assembly compiled successfully. Available types:\n");
+            foreach (Type type in assembly.GetTypes())
+            {
+                typeList.AppendLine($"- {type.FullName}");
+            }
+            return typeList.ToString();
+        }
+
+        /// <summary>
+        /// Saves the generated code to a file for reference
+        /// </summary>
+        private void SaveGeneratedCode(string code, string prompt)
+        {
+            try
+            {
+                string timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
+                string sanitizedPrompt = new string(prompt.Take(20).ToArray())
+                    .Replace(' ', '_')
+                    .Replace('/', '_')
+                    .Replace('\\', '_');
+
+                string fileName = $"{timestamp}_{sanitizedPrompt}.cs";
+                string fullPath = Path.Combine(Application.persistentDataPath, scriptOutputDirectory, fileName);
+
+                File.WriteAllText(fullPath, code);
+                Debug.Log($"Generated code saved to {fullPath}");
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError($"Failed to save generated code: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Clean up any dynamic behaviors when the script is destroyed
+        /// </summary>
+        private void OnDestroy()
+        {
+            foreach (MonoBehaviour behavior in dynamicBehaviors)
+            {
+                if (behavior != null)
+                {
+                    Destroy(behavior);
+                }
+            }
+
+            dynamicBehaviors.Clear();
+            dynamicAssemblies.Clear();
+        }
+    }
+}
